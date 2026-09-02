@@ -1,5 +1,6 @@
 from decimal import Decimal
 from datetime import date
+import json
 
 import httpx
 import pytest
@@ -141,7 +142,7 @@ def test_upstream_failure_is_not_a_successful_zero():
     with TestClient(create_test_app(transport)) as client:
         response = client.get("/tools/convert", params=query())
     assert response.status_code == 502
-    assert response.json()["error"] == "upstream_error"
+    assert response.json()["error"] == "upstream_unavailable"
 
 
 @pytest.mark.parametrize(
@@ -263,3 +264,125 @@ def test_framework_errors_use_common_body(fake_api, method, path, status):
     assert set(response.json()) == {"error", "message"}
     assert response.json()["error"] == "http_error"
     assert calls == []
+
+
+VALID_UPSTREAM = {"base": "EUR", "date": "2026-08-28", "rates": {"TRY": 47.1234}}
+UPSTREAM_ERRORS = {
+    "rate_unavailable": (422, "No rate is available for the requested currencies and date."),
+    "upstream_timeout": (504, "The rate provider timed out."),
+    "upstream_unavailable": (502, "The rate provider is unavailable."),
+    "invalid_upstream_response": (502, "The rate provider returned an invalid response."),
+}
+
+
+def upstream_error_cases():
+    for status in (400, 404, 422, 429, 500, 503, 599, 301, 302, 307, 401, 403, 418):
+        code = (
+            "rate_unavailable" if status in (400, 404, 422)
+            else "upstream_unavailable" if status == 429 or status >= 500
+            else "invalid_upstream_response"
+        )
+        yield pytest.param("status", status, code, id=f"status-{status}")
+    for error in (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout,
+                  httpx.PoolTimeout, httpx.ConnectError, httpx.ReadError,
+                  httpx.RemoteProtocolError):
+        code = "upstream_timeout" if issubclass(error, httpx.TimeoutException) else "upstream_unavailable"
+        yield pytest.param("exception", error, code, id=error.__name__)
+    for label, body in [
+        ("html", "<html>private upstream diagnostic</html>"),
+        ("broken-json", "{"), ("array", "[]"), ("null-body", "null"),
+        ("number-body", "123"), ("string-body", '"private diagnostic"'),
+    ]:
+        yield pytest.param("body", body, "invalid_upstream_response", id=label)
+    for field in ("base", "date", "rates"):
+        body = {key: value for key, value in VALID_UPSTREAM.items() if key != field}
+        yield pytest.param("body", json.dumps(body), "invalid_upstream_response", id=f"missing-{field}")
+    for field, values in [
+        ("base", [None, 123, True, [], {}, "USD", "EU", "E1R", "ÉUR", "eır", "ßa"]),
+        ("date", [None, 123, True, [], {}, "bad", "2026-02-30", "20260828",
+                  "2026-8-28", "2026-08-28T00:00:00", "2026-08-31"]),
+        ("rates", [None, 123, True, [], "bad"]),
+    ]:
+        for index, value in enumerate(values):
+            body = {**VALID_UPSTREAM, field: value}
+            yield pytest.param("body", json.dumps(body), "invalid_upstream_response", id=f"invalid-{field}-{index}")
+    for index, value in enumerate([None, True, False, "bad", "47.1234", "NaN",
+                                   "Infinity", float("nan"), float("inf"),
+                                   float("-inf"), 0, -1, [], {}]):
+        body = {**VALID_UPSTREAM, "rates": {"TRY": value}}
+        yield pytest.param("body", json.dumps(body), "invalid_upstream_response", id=f"invalid-rate-{index}")
+    for rates in ({}, {"USD": 1}, {"try": 47}):
+        yield pytest.param("body", json.dumps({**VALID_UPSTREAM, "rates": rates}),
+                           "rate_unavailable", id=f"missing-target-{rates}")
+
+
+@pytest.mark.parametrize("kind,value,code", list(upstream_error_cases()))
+def test_upstream_error_is_safe_and_not_cached(kind, value, code):
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        if len(calls) > 1:
+            return httpx.Response(200, json=VALID_UPSTREAM)
+        if kind == "exception":
+            raise value("private diagnostic https://internal.invalid/secret", request=request)
+        if kind == "status":
+            return httpx.Response(value, text="private upstream diagnostic",
+                                  headers={"Location": "https://internal.invalid/secret"})
+        return httpx.Response(200, text=value)
+
+    transport = strict_transport(respond, ["2026-08-30", "2026-08-30"])
+    with TestClient(create_test_app(transport)) as client:
+        failed = client.get("/tools/convert", params=query())
+        status, message = UPSTREAM_ERRORS[code]
+        assert failed.status_code == status
+        assert failed.json() == {"error": code, "message": message}
+        assert len(calls) == 1
+        assert client.app.state.fx_service.cache == {}
+
+        recovered = client.get("/tools/convert", params=query())
+        assert recovered.status_code == 200
+        assert recovered.json()["rate"] == 47.1234
+        assert recovered.json()["result"] == 11780.85
+        assert recovered.json()["rate_date"] == "2026-08-28"
+        assert recovered.json()["asked_date"] == "2026-08-30"
+        assert len(calls) == 2
+        assert client.app.state.fx_service.cache == {
+            ("EUR", "TRY", date(2026, 8, 30)): (Decimal("47.1234"), date(2026, 8, 28))
+        }
+
+        cached = client.get("/tools/convert", params=query())
+        assert cached.status_code == 200
+        assert cached.json() == recovered.json()
+        assert len(calls) == 2
+
+
+@pytest.mark.parametrize("rate_date", ["2026-08-28", "2026-08-30"])
+@pytest.mark.parametrize("upstream_base", ["EUR", " eur "])
+def test_upstream_date_and_normalized_base_are_preserved(rate_date, upstream_base):
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(200, json={**VALID_UPSTREAM, "base": upstream_base, "date": rate_date})
+
+    with TestClient(create_test_app(strict_transport(respond, ["2026-08-30"]))) as client:
+        first = client.get("/tools/convert", params=query())
+        cached = client.get("/tools/convert", params=query())
+    assert first.status_code == cached.status_code == 200
+    assert first.json() == cached.json()
+    assert first.json()["rate_date"] == rate_date
+    assert first.json()["asked_date"] == "2026-08-30"
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("rate", ["1", "1.005", "47.12345678901234567890123456789"])
+def test_upstream_numeric_rate_remains_decimal_in_cache(rate):
+    body = '{"base":"EUR","date":"2026-08-28","rates":{"TRY":' + rate + '}}'
+    transport = strict_transport(lambda request: httpx.Response(200, text=body), ["2026-08-30"])
+    with TestClient(create_test_app(transport)) as client:
+        response = client.get("/tools/convert", params=query(amount="1"))
+        assert response.status_code == 200
+        cached_rate, _ = client.app.state.fx_service.cache[("EUR", "TRY", date(2026, 8, 30))]
+        assert isinstance(cached_rate, Decimal)
+        assert cached_rate == Decimal(rate)

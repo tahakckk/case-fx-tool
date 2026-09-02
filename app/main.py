@@ -79,8 +79,8 @@ def create_app(
 
     @application.exception_handler(UpstreamError)
     async def upstream_error(request: Request, exc: UpstreamError) -> JSONResponse:
-        error = ErrorResponse(error="upstream_error", message=str(exc))
-        return JSONResponse(status_code=502, content=error.model_dump())
+        error = ErrorResponse(error=exc.code, message=exc.message)
+        return JSONResponse(status_code=exc.status, content=error.model_dump())
 
     @application.exception_handler(RequestValidationError)
     async def validation_error(
